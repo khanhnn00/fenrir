@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3a55"/>
+      <stop offset="1" stop-color="#121a2b"/>
+    </linearGradient>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c9d6ea"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- Wolf head, symmetric about x=512. Same outline as Mark.swift (FenrirMark), 100-unit grid scaled by 6.4 at (192,192). -->
+  <g transform="translate(192 192) scale(6.4)">
+    <path fill="url(#fur)" d="M50 24 L63 28 L84 4 L90 40 L97 58 L82 63 L88 82 L68 77 L59 97 L50 86 L41 97 L32 77 L12 82 L18 63 L3 58 L10 40 L16 4 L37 28 Z"/>
+    <path fill="#16203a" d="M60 47 L78 43 L72 55 Z M40 47 L22 43 L28 55 Z"/>
+    <path fill="#16203a" d="M43 68 L57 68 L50 77 Z"/>
+  </g>
+</svg>

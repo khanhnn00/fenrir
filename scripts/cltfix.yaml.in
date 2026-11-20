@@ -1,0 +1,9 @@
+{
+  "version": 0,
+  "roots": [
+    { "name": "/Library/Developer/CommandLineTools/usr/include/swift", "type": "directory",
+      "contents": [
+        { "name": "bridging.modulemap", "type": "file", "external-contents": "@EMPTY@" }
+      ] }
+  ]
+}

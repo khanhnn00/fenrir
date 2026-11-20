@@ -1,0 +1,825 @@
+diff --git a/Sources/SwiftTerm/Apple/AppleTerminalView.swift b/Sources/SwiftTerm/Apple/AppleTerminalView.swift
+index b80fb13..6ee0652 100644
+--- a/Sources/SwiftTerm/Apple/AppleTerminalView.swift
++++ b/Sources/SwiftTerm/Apple/AppleTerminalView.swift
+@@ -88,6 +88,7 @@ extension TerminalView {
+         // Install carret view
+         if caretView == nil {
+             caretView = CaretView(frame: CGRect(origin: .zero, size: CGSize(width: cellDimension.width, height: cellDimension.height)), cursorStyle: terminal.options.cursorStyle)
++            caretView.terminalView = self
+             addSubview(caretView)
+         } else {
+             updateCaretView ()
+@@ -280,7 +281,12 @@ extension TerminalView {
+             tf = fontSet.normal
+         }
+         
+-        let fgColor = mapColor (color: fg, isFg: true, isBold: isBold)
++        var fgColor = mapColor (color: fg, isFg: true, isBold: isBold)
++        if flags.contains (.dim) {
++            // SGR 2 (faint): half way between the text colour and the cell background.
++            let back = mapColor (color: bg, isFg: false, isBold: false)
++            fgColor = fgColor.blended (withFraction: 0.5, of: back) ?? fgColor
++        }
+         var nsattr: [NSAttributedString.Key:Any] = [
+             .font: tf,
+             .foregroundColor: fgColor,
+@@ -338,7 +344,7 @@ extension TerminalView {
+                     hasUrl = chhas
+                 }
+             }
+-            str.append(ch.code == 0 ? " " : ch.getCharacter ())
++            str.append(ch.code == 0 || BoxDrawing.handles(ch.code) ? " " : ch.getCharacter ())
+         }
+         res.append (NSAttributedString(string: str, attributes: getAttributes(attr, withUrl: hasUrl)))
+         updateSelectionAttributesIfNeeded(attributedLine: res, row: row, cols: cols)
+@@ -642,6 +648,7 @@ extension TerminalView {
+ 
+                 col += runGlyphsCount
+             }
++            drawBoxCells(line: line, origin: lineOrigin, context: context)
+             // Render any sixel content last
+             if let images = lineInfo.images {
+                 let rowBase = frame.height - (CGFloat(row) * cellDimension.height)
+@@ -785,8 +792,27 @@ extension TerminalView {
+         let offset = (cellDimension.height * (CGFloat(buffer.y-(buffer.yDisp-buffer.yBase)+1)))
+         let lineOrigin = CGPoint(x: 0, y: frame.height - offset)
+         #endif
+-        caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
++        let newOrigin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
++        #if os(macOS)
++        // Keep the glyph under a block cursor current; a moved cursor restarts the blink period.
++        let cell = buffer.lines[vy][min(buffer.x, buffer.cols - 1)]
++        let ch: Character = cell.code == 0 ? " " : cell.getCharacter()
++        let flags = cell.attribute.style
++        if ch != caretView.glyph || flags.contains(.bold) != caretView.glyphBold || flags.contains(.italic) != caretView.glyphItalic {
++            caretView.glyph = ch
++            caretView.glyphBold = flags.contains(.bold)
++            caretView.glyphItalic = flags.contains(.italic)
++            caretView.needsDisplay = true
++        }
++        if newOrigin != caretView.frame.origin { caretView.pulse() }
++        #endif
++        caretView.frame.origin = newOrigin
+     }
++
++    /// True while the caret is painted (blink phase on, or steady). For self tests.
++    public var caretIsPainted: Bool { caretView.isPainted }
++    /// True when the terminal is first responder of the key window. For self tests.
++    public var caretIsActive: Bool { caretView.isActive }
+     
+     // Does not use a default argument and merge, because it is called back
+     func updateDisplay ()
+@@ -895,6 +921,9 @@ extension TerminalView {
+         }
+     }
+     
++    /// True while a full-screen app (alternate screen) is showing.
++    public var isAlternateScreen: Bool { terminal.buffers.isAlternateBuffer }
++
+     public func scroll (toPosition: Double)
+     {
+         userScrolling = true
+@@ -923,6 +952,8 @@ extension TerminalView {
+         if row != terminal.buffer.yDisp {
+             
+             terminal.buffer.yDisp = row
++            // Output must not snap the viewport back to the bottom while the user is reading scrollback.
++            terminal.userScrolling = row < terminal.buffer.yBase
+             
+             // tell the terminal we want to refresh all the rows
+             terminal.refresh (startRow: 0, endRow: terminal.rows)
+@@ -973,7 +1004,7 @@ extension TerminalView {
+     func feedPrepare()
+     {
+         search.invalidate()
+-        selection.active = false
++        // Keep the selection while data arrives (spinners and status lines redraw constantly).
+         startDisplayUpdates()
+     }
+     
+@@ -1016,6 +1047,7 @@ extension TerminalView {
+     public func send(data: ArraySlice<UInt8>)
+     {
+         ensureCaretIsVisible ()
++        caretView.pulse ()
+         terminalDelegate?.send (source: self, data: data)
+     }
+     
+@@ -1207,3 +1239,10 @@ extension TerminalView {
+     
+ }
+ #endif
++
++#if os(macOS)
++extension TerminalView {
++    /// For self tests that run while another app is frontmost: treat the first responder as focused.
++    public static func caretIgnoresKeyWindow(_ on: Bool) { CaretView.ignoreKeyWindow = on }
++}
++#endif
+diff --git a/Sources/SwiftTerm/Apple/BoxDrawing.swift b/Sources/SwiftTerm/Apple/BoxDrawing.swift
+new file mode 100644
+index 0000000..74ad13f
+--- /dev/null
++++ b/Sources/SwiftTerm/Apple/BoxDrawing.swift
+@@ -0,0 +1,181 @@
++//
++// BoxDrawing.swift
++//
++// Draws box-drawing (U+2500-257F) and block-element (U+2580-259F) cells as pixel-snapped rectangles
++// that span the whole cell, so rules and frames join across cells and rows instead of showing the
++// hairline seams that font glyphs leave at fractional cell edges.
++//
++#if os(macOS)
++import Foundation
++import CoreGraphics
++import AppKit
++
++enum BoxDrawing {
++    /// Cells drawn here are blanked in the attributed string.
++    static func handles(_ code: Int32) -> Bool {
++        (0x2500...0x2570).contains(code) || (0x2574...0x259F).contains(code)
++    }
++
++    /// Stroke weights: 0 none, 1 light, 2 heavy (double lines render heavy).
++    typealias Arms = (l: UInt8, r: UInt8, u: UInt8, d: UInt8)
++
++    static func arms(_ c: Int32) -> Arms? {
++        switch c {
++        case 0x2500, 0x2504, 0x2508, 0x254C: return (1, 1, 0, 0)
++        case 0x2501, 0x2505, 0x2509, 0x254D: return (2, 2, 0, 0)
++        case 0x2502, 0x2506, 0x250A, 0x254E: return (0, 0, 1, 1)
++        case 0x2503, 0x2507, 0x250B, 0x254F: return (0, 0, 2, 2)
++        case 0x250C...0x254B:
++            let i = Int(c - 0x250C)
++            // Corners 250C-2523 and tees 2524-254B follow a fixed weight sequence; compute from the group.
++            return table[i]
++        case 0x2550, 0x2551...0x256C: return double(c)
++        case 0x256D: return (0, 1, 0, 1)
++        case 0x256E: return (1, 0, 0, 1)
++        case 0x256F: return (1, 0, 1, 0)
++        case 0x2570: return (0, 1, 1, 0)
++        case 0x2574: return (1, 0, 0, 0)
++        case 0x2575: return (0, 0, 1, 0)
++        case 0x2576: return (0, 1, 0, 0)
++        case 0x2577: return (0, 0, 0, 1)
++        case 0x2578: return (2, 0, 0, 0)
++        case 0x2579: return (0, 0, 2, 0)
++        case 0x257A: return (0, 2, 0, 0)
++        case 0x257B: return (0, 0, 0, 2)
++        case 0x257C: return (1, 2, 0, 0)
++        case 0x257D: return (0, 0, 1, 2)
++        case 0x257E: return (2, 1, 0, 0)
++        case 0x257F: return (0, 0, 2, 1)
++        default: return nil
++        }
++    }
++
++    // 250C...254B as (l, r, u, d), in code point order.
++    private static let table: [Arms] = [
++        (0,1,0,1), (0,2,0,1), (0,1,0,2), (0,2,0,2),   // 250C-250F  down-right corners
++        (1,0,0,1), (2,0,0,1), (1,0,0,2), (2,0,0,2),   // 2510-2513  down-left
++        (0,1,1,0), (0,2,1,0), (0,1,2,0), (0,2,2,0),   // 2514-2517  up-right
++        (1,0,1,0), (2,0,1,0), (1,0,2,0), (2,0,2,0),   // 2518-251B  up-left
++        (0,1,1,1), (0,2,1,1), (0,1,2,1), (0,1,1,2),   // 251C-251F  vertical + right
++        (0,1,2,2), (0,2,2,1), (0,2,1,2), (0,2,2,2),   // 2520-2523
++        (1,0,1,1), (2,0,1,1), (1,0,2,1), (1,0,1,2),   // 2524-2527  vertical + left
++        (1,0,2,2), (2,0,2,1), (2,0,1,2), (2,0,2,2),   // 2528-252B
++        (1,1,0,1), (2,1,0,1), (1,2,0,1), (2,2,0,1),   // 252C-252F  horizontal + down
++        (1,1,0,2), (2,1,0,2), (1,2,0,2), (2,2,0,2),   // 2530-2533
++        (1,1,1,0), (2,1,1,0), (1,2,1,0), (2,2,1,0),   // 2534-2537  horizontal + up
++        (1,1,2,0), (2,1,2,0), (1,2,2,0), (2,2,2,0),   // 2538-253B
++        (1,1,1,1), (2,1,1,1), (1,2,1,1), (2,2,1,1),   // 253C-253F  cross
++        (1,1,2,1), (1,1,1,2), (1,1,2,2), (2,1,2,1),   // 2540-2543
++        (1,2,2,1), (2,1,1,2), (1,2,1,2), (2,2,2,1),   // 2544-2547
++        (2,2,1,2), (2,1,2,2), (1,2,2,2), (2,2,2,2),   // 2548-254B
++    ]
++
++    private static func double(_ c: Int32) -> Arms? {
++        switch c {
++        case 0x2550: return (2, 2, 0, 0)
++        case 0x2551: return (0, 0, 2, 2)
++        case 0x2552: return (0, 2, 0, 1)
++        case 0x2553: return (0, 1, 0, 2)
++        case 0x2554: return (0, 2, 0, 2)
++        case 0x2555: return (2, 0, 0, 1)
++        case 0x2556: return (1, 0, 0, 2)
++        case 0x2557: return (2, 0, 0, 2)
++        case 0x2558: return (0, 2, 1, 0)
++        case 0x2559: return (0, 1, 2, 0)
++        case 0x255A: return (0, 2, 2, 0)
++        case 0x255B: return (2, 0, 1, 0)
++        case 0x255C: return (1, 0, 2, 0)
++        case 0x255D: return (2, 0, 2, 0)
++        case 0x255E: return (0, 2, 1, 1)
++        case 0x255F: return (0, 1, 2, 2)
++        case 0x2560: return (0, 2, 2, 2)
++        case 0x2561: return (2, 0, 1, 1)
++        case 0x2562: return (1, 0, 2, 2)
++        case 0x2563: return (2, 0, 2, 2)
++        case 0x2564: return (2, 2, 0, 1)
++        case 0x2565: return (1, 1, 0, 2)
++        case 0x2566: return (2, 2, 0, 2)
++        case 0x2567: return (2, 2, 1, 0)
++        case 0x2568: return (1, 1, 2, 0)
++        case 0x2569: return (2, 2, 2, 0)
++        case 0x256A: return (2, 2, 1, 1)
++        case 0x256B: return (1, 1, 2, 2)
++        case 0x256C: return (2, 2, 2, 2)
++        default: return nil
++        }
++    }
++
++    /// Block elements as fractions of the cell: (x0, y0, x1, y1) with y measured from the top, plus alpha.
++    static func blocks(_ c: Int32) -> (rects: [(CGFloat, CGFloat, CGFloat, CGFloat)], alpha: CGFloat)? {
++        func r(_ x0: CGFloat, _ y0: CGFloat, _ x1: CGFloat, _ y1: CGFloat) -> (CGFloat, CGFloat, CGFloat, CGFloat) { (x0, y0, x1, y1) }
++        let ul = r(0, 0, 0.5, 0.5), ur = r(0.5, 0, 1, 0.5), ll = r(0, 0.5, 0.5, 1), lr = r(0.5, 0.5, 1, 1)
++        switch c {
++        case 0x2580: return ([r(0, 0, 1, 0.5)], 1)
++        case 0x2581...0x2588: return ([r(0, 1 - CGFloat(c - 0x2580) / 8, 1, 1)], 1)
++        case 0x2589...0x258F: return ([r(0, 0, CGFloat(0x2590 - c) / 8, 1)], 1)
++        case 0x2590: return ([r(0.5, 0, 1, 1)], 1)
++        case 0x2591: return ([r(0, 0, 1, 1)], 0.25)
++        case 0x2592: return ([r(0, 0, 1, 1)], 0.5)
++        case 0x2593: return ([r(0, 0, 1, 1)], 0.75)
++        case 0x2594: return ([r(0, 0, 1, 0.125)], 1)
++        case 0x2595: return ([r(0.875, 0, 1, 1)], 1)
++        case 0x2596: return ([ll], 1)
++        case 0x2597: return ([lr], 1)
++        case 0x2598: return ([ul], 1)
++        case 0x2599: return ([ul, ll, lr], 1)
++        case 0x259A: return ([ul, lr], 1)
++        case 0x259B: return ([ul, ur, ll], 1)
++        case 0x259C: return ([ul, ur, lr], 1)
++        case 0x259D: return ([ur], 1)
++        case 0x259E: return ([ur, ll], 1)
++        case 0x259F: return ([ur, ll, lr], 1)
++        default: return nil
++        }
++    }
++}
++
++extension TerminalView {
++    /// Paints the box-drawing / block cells of one row. `origin` is the bottom-left corner of the row.
++    func drawBoxCells(line: BufferLine, origin: CGPoint, context: CGContext) {
++        let cw = cellDimension.width, ch = cellDimension.height
++        let scale = max(backingScaleFactor(), 1)
++        func snap(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
++        let px = 1 / scale
++        let light = max(px, (cw * scale / 8).rounded() * px)
++
++        for col in 0..<terminal.cols {
++            let cd = line[col]
++            guard BoxDrawing.handles(cd.code) else { continue }
++            var fg = cd.attribute.fg, bg = cd.attribute.bg
++            if cd.attribute.style.contains(.inverse) {
++                swap(&fg, &bg)
++                if fg == .defaultColor { fg = .defaultInvertedColor }
++            }
++            let color = mapColor(color: fg, isFg: true, isBold: cd.attribute.style.contains(.bold))
++            let x0 = snap(origin.x + CGFloat(col) * cw), x1 = snap(origin.x + CGFloat(col + 1) * cw)
++            let y0 = snap(origin.y), y1 = snap(origin.y + ch)
++
++            context.saveGState()
++            context.setShouldAntialias(false)
++            context.setFillColor(color.cgColor)
++            if let b = BoxDrawing.blocks(cd.code) {
++                if b.alpha < 1 { context.setAlpha(b.alpha) }
++                for f in b.rects {
++                    context.fill(CGRect(x: snap(x0 + f.0 * (x1 - x0)), y: snap(y1 - f.3 * (y1 - y0)),
++                                        width: snap(x0 + f.2 * (x1 - x0)) - snap(x0 + f.0 * (x1 - x0)),
++                                        height: snap(y1 - f.1 * (y1 - y0)) - snap(y1 - f.3 * (y1 - y0))))
++                }
++            } else if let a = BoxDrawing.arms(cd.code) {
++                let hl = CGFloat(max(a.l, a.r, 1)) * light, vl = CGFloat(max(a.u, a.d, 1)) * light
++                let cx = snap((x0 + x1) / 2 - vl / 2), cy = snap((y0 + y1) / 2 - hl / 2)
++                // Each arm runs from the cell edge to the far side of the crossing stroke.
++                if a.l > 0 { context.fill(CGRect(x: x0, y: snap((y0 + y1) / 2 - CGFloat(a.l) * light / 2), width: cx + vl - x0, height: CGFloat(a.l) * light)) }
++                if a.r > 0 { context.fill(CGRect(x: cx, y: snap((y0 + y1) / 2 - CGFloat(a.r) * light / 2), width: x1 - cx, height: CGFloat(a.r) * light)) }
++                if a.d > 0 { context.fill(CGRect(x: snap((x0 + x1) / 2 - CGFloat(a.d) * light / 2), y: y0, width: CGFloat(a.d) * light, height: cy + hl - y0)) }
++                if a.u > 0 { context.fill(CGRect(x: snap((x0 + x1) / 2 - CGFloat(a.u) * light / 2), y: cy, width: CGFloat(a.u) * light, height: y1 - cy)) }
++            }
++            context.restoreGState()
++        }
++    }
++}
++#endif
+diff --git a/Sources/SwiftTerm/Mac/MacCaretView.swift b/Sources/SwiftTerm/Mac/MacCaretView.swift
+index dee7670..b03b212 100644
+--- a/Sources/SwiftTerm/Mac/MacCaretView.swift
++++ b/Sources/SwiftTerm/Mac/MacCaretView.swift
+@@ -1,9 +1,9 @@
+ //
+ //  MacCaretView.swift
+-//  
+-// Implements the caret in the Mac caret view
+ //
+-//  Created by Miguel de Icaza on 3/20/20.
++// The caret overlay. It blinks from a run-loop timer (not a Core Animation animation, which the
++// system drops whenever the layer leaves the render tree), paints a block cursor with the glyph
++// underneath it in the inverse colour, and draws a hollow box when the terminal is not focused.
+ //
+ 
+ #if os(macOS)
+@@ -14,86 +14,185 @@ import CoreGraphics
+ 
+ // The CaretView is used to show the cursor
+ class CaretView: NSView {
+-    var sub: CALayer
+-    
++    static let blinkInterval: TimeInterval = 0.53
++
++    /// Character under the cursor and the attributes of its cell; set by the terminal view.
++    var glyph: Character = " "
++    var glyphBold = false
++    var glyphItalic = false
++    var glyphWide = false
++    weak var terminalView: TerminalView?
++
++    /// Phase of the blink; true while the cursor is painted.
++    private(set) var blinkOn = true
++    private var timer: Timer?
++    private var observers: [NSObjectProtocol] = []
++
+     public init (frame: CGRect, cursorStyle: CursorStyle)
+     {
+         style = cursorStyle
+-        sub = CALayer ()
+         super.init(frame: frame)
+         wantsLayer = true
+-        layer?.addSublayer(sub)
+-        
+-        updateView()
++        layer?.drawsAsynchronously = false
+     }
+-    
++
+     required init?(coder: NSCoder) {
+         fatalError("init(coder:) has not been implemented")
+     }
+-    
++
++    deinit {
++        timer?.invalidate()
++        observers.forEach { NotificationCenter.default.removeObserver($0) }
++    }
++
+     var style: CursorStyle {
+         didSet {
+             updateCursorStyle ()
+         }
+     }
+-    
+-    func updateCursorStyle () {
+-        switch style {
+-        case .blinkUnderline, .blinkBlock, .blinkBar:
+-            let anim = CABasicAnimation.init(keyPath: #keyPath (CALayer.opacity))
+-            anim.duration = 0.7
+-            anim.autoreverses = true
+-            anim.repeatCount = Float.infinity
+-            anim.fromValue = NSNumber (floatLiteral: 1)
+-            anim.toValue = NSNumber (floatLiteral: 0.3)
+-            anim.timingFunction = CAMediaTimingFunction (name: .easeInEaseOut)
+-            sub.add(anim, forKey: #keyPath (CALayer.opacity))
+-        case .steadyBar, .steadyBlock, .steadyUnderline:
+-            sub.removeAllAnimations()
+-            sub.opacity = 1
+-        }
+-        
+-        guard let layer = self.layer else {
+-            return
+-        }
++
++    var isBlinkingStyle: Bool {
+         switch style {
+-        case .steadyBlock, .blinkBlock:
+-            sub.frame = CGRect (x: 0, y: 0, width: layer.bounds.width, height: layer.bounds.height)
+-        case .steadyUnderline, .blinkUnderline:
+-            sub.frame = CGRect (x: 0, y: 0, width: layer.bounds.width, height: 2)
+-        case .steadyBar, .blinkBar:
+-            sub.frame = CGRect (x: 0, y: 0, width: 2, height: layer.bounds.height)
++        case .blinkUnderline, .blinkBlock, .blinkBar: return true
++        default: return false
+         }
++    }
+ 
++    /// Focused for drawing purposes: first responder of the key window.
++    var isActive: Bool { focused && (CaretView.ignoreKeyWindow || (window?.isKeyWindow ?? false)) }
++    /// Self tests run without being the frontmost app, so they ask the caret to ignore window key state.
++    nonisolated(unsafe) static var ignoreKeyWindow = false
++
++    func updateCursorStyle () {
++        pulse()
+     }
+-    
++
++    /// Shows the cursor and restarts the blink period (called when keys are typed, the cursor moves,
++    /// focus changes or the view is attached again).
++    func pulse () {
++        blinkOn = true
++        restartTimer()
++        needsDisplay = true
++    }
++
++    private func restartTimer () {
++        timer?.invalidate()
++        timer = nil
++        guard window != nil, isBlinkingStyle, isActive else { return }
++        let t = Timer(timeInterval: CaretView.blinkInterval, repeats: true) { [weak self] _ in
++            guard let self = self else { return }
++            self.blinkOn.toggle()
++            self.needsDisplay = true
++        }
++        RunLoop.main.add(t, forMode: .common)
++        timer = t
++    }
++
+     func disableAnimations () {
+-        sub.removeAllAnimations()
++        timer?.invalidate()
++        timer = nil
++        blinkOn = true
++        needsDisplay = true
++    }
++
++    override func viewDidMoveToWindow() {
++        super.viewDidMoveToWindow()
++        observers.forEach { NotificationCenter.default.removeObserver($0) }
++        observers = []
++        if let w = window {
++            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
++                observers.append(NotificationCenter.default.addObserver(forName: name, object: w, queue: .main) { [weak self] _ in
++                    self?.pulse()
++                })
++            }
++        }
++        pulse()
++    }
++
++    override func viewDidUnhide() {
++        super.viewDidUnhide()
++        pulse()
+     }
+-    
++
+     public var defaultCaretColor = NSColor.selectedControlColor
+-    
++
+     public var caretColor: NSColor = NSColor.selectedControlColor {
+         didSet {
+-            updateView()
++            needsDisplay = true
+         }
+     }
+-    
++
+     public var focused: Bool = false {
+         didSet {
+-            updateView()
++            pulse()
++        }
++    }
++
++    /// True when the caret rectangle is currently painted (blink on, or steady).
++    var isPainted: Bool { !isHiddenOrHasHiddenAncestor && superview != nil && window != nil && blinkOn }
++
++    private var isBlockStyle: Bool {
++        switch style {
++        case .steadyBlock, .blinkBlock: return true
++        default: return false
++        }
++    }
++
++    override func draw(_ dirtyRect: NSRect) {
++        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
++        ctx.clear(bounds)
++        let active = isActive
++        // Unfocused: a steady hollow box, whatever the shape, so the position stays visible.
++        if !active {
++            ctx.setStrokeColor(caretColor.cgColor)
++            ctx.setLineWidth(1)
++            ctx.stroke(bounds.insetBy(dx: 0.5, dy: 0.5))
++            return
+         }
++        guard blinkOn else { return }
++        ctx.setFillColor(caretColor.cgColor)
++        switch style {
++        case .steadyBlock, .blinkBlock:
++            ctx.fill(bounds)
++            drawInvertedGlyph(in: ctx)
++        case .steadyUnderline, .blinkUnderline:
++            ctx.fill(CGRect(x: 0, y: 0, width: bounds.width, height: 2))
++        case .steadyBar, .blinkBar:
++            ctx.fill(CGRect(x: 0, y: 0, width: 2, height: bounds.height))
++        }
++    }
++
++    /// Redraws the character under a block cursor in whichever of the terminal's background or
++    /// foreground colours contrasts most with the cursor fill, at full strength (faint included).
++    private func drawInvertedGlyph(in ctx: CGContext) {
++        guard let tv = terminalView, glyph != " ", glyph != "\0",
++              !glyph.unicodeScalars.contains(where: { BoxDrawing.handles(Int32($0.value)) }) else { return }
++        let bg = tv.nativeBackgroundColor, fg = tv.nativeForegroundColor
++        let ink = CaretView.contrast(bg, caretColor) >= CaretView.contrast(fg, caretColor) ? bg : fg
++        let font = glyphBold ? (glyphItalic ? tv.fontSet.boldItalic : tv.fontSet.bold)
++                             : (glyphItalic ? tv.fontSet.italic : tv.fontSet.normal)
++        let str = NSAttributedString(string: String(glyph), attributes: [
++            .font: font, .foregroundColor: ink.cgColor,
++        ])
++        let line = CTLineCreateWithAttributedString(str)
++        let base = ceil(CTFontGetLeading(tv.fontSet.normal) + CTFontGetDescent(tv.fontSet.normal))
++        ctx.saveGState()
++        ctx.textPosition = CGPoint(x: 0, y: base)
++        CTLineDraw(line, ctx)
++        ctx.restoreGState()
+     }
+ 
+-    func updateView() {
+-        let isFirst = focused
+-        guard let layer = layer else { return }
+-        sub.frame = CGRect (origin: CGPoint.zero, size: layer.frame.size)
+-        sub.borderWidth = isFirst ? 0 : 1
+-        sub.borderColor = caretColor.cgColor
+-        sub.backgroundColor = isFirst ? caretColor.cgColor : NSColor.clear.cgColor
++    private static func luminance(_ c: NSColor) -> CGFloat {
++        let s = c.usingColorSpace(.sRGB) ?? c
++        func lin(_ v: CGFloat) -> CGFloat { v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
++        return 0.2126 * lin(s.redComponent) + 0.7152 * lin(s.greenComponent) + 0.0722 * lin(s.blueComponent)
+     }
+-    
++
++    private static func contrast(_ a: NSColor, _ b: NSColor) -> CGFloat {
++        let la = luminance(a), lb = luminance(b)
++        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
++    }
++
+     override func hitTest(_ point: NSPoint) -> NSView? {
+         // we do not want to steal hits, let the terminal view take them
+         return nil
+diff --git a/Sources/SwiftTerm/Mac/MacTerminalView.swift b/Sources/SwiftTerm/Mac/MacTerminalView.swift
+index 68d74f0..1307cb0 100644
+--- a/Sources/SwiftTerm/Mac/MacTerminalView.swift
++++ b/Sources/SwiftTerm/Mac/MacTerminalView.swift
+@@ -306,7 +306,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+     }
+     
+     open func linefeed(source: Terminal) {
+-        selection.selectNone()
++        // Keep the selection while output streams, so text above can be selected while an agent is still running.
+     }
+     
+     /// This vaiable controls whether mouse events are sent to the application running under the
+@@ -401,7 +401,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+         let response = super.becomeFirstResponder()
+         if response {
+             hasFocus = true
+-            caretView.updateCursorStyle()
+         }
+         return response
+     }
+@@ -409,7 +408,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+     public override func resignFirstResponder() -> Bool {
+         let response = super.resignFirstResponder()
+         if response {
+-            caretView.disableAnimations()
+             hasFocus = false
+         }
+         return response
+@@ -826,8 +824,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+         }
+     }
+     
++    /// The gesture in progress belongs to the application (mouse tracking on and Option held at press).
++    /// A plain drag always selects locally, so tmux / TUI mouse modes cannot swallow selection.
++    private var mouseGoesToApp = false
++
+     public override func mouseDown(with event: NSEvent) {
+-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
++        mouseGoesToApp = allowMouseReporting && event.modifierFlags.contains(.option) && terminal.mouseMode.sendButtonPress()
++        if mouseGoesToApp {
+             sharedMouseEvent(with: event)
+             return
+         }
+@@ -861,18 +864,77 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+         return cd.getPayload()
+     }
+     
++    /// A plain-text http(s) URL under the mouse, joining soft-wrapped rows so long URLs still match.
++    func plainURL (for event: NSEvent) -> String? { plainURLMatch(for: event)?.url }
++
++    /// URL under the mouse plus the columns it covers on the hovered screen row (for the hover underline).
++    func plainURLMatch (for event: NSEvent) -> (url: String, screenRow: Int, startCol: Int, endCol: Int)? {
++        let hit = calculateMouseHit(with: event).grid
++        let lines = terminal.buffer.lines
++        let row = terminal.buffer.yDisp + hit.row
++        guard row >= 0 && row < lines.count else { return nil }
++        var first = row
++        while first > 0 && lines[first].isWrapped { first -= 1 }
++        var last = row
++        while last + 1 < lines.count && lines[last + 1].isWrapped { last += 1 }
++        let cols = terminal.cols
++        // Each row is padded to the full width with spaces so offsets stay column-aligned and empty cells never leak NULs.
++        var text = ""
++        for i in first...last {
++            var s = lines[i].translateToString().replacingOccurrences(of: "\u{0}", with: " ")
++            let len = (s as NSString).length
++            if len < cols { s += String(repeating: " ", count: cols - len) }
++            text += s
++        }
++        let rowStart = (row - first) * cols
++        let offset = rowStart + hit.col
++        guard let regex = try? NSRegularExpression(pattern: #"https?://[^\s<>"'`]+"#) else { return nil }
++        let ns = text as NSString
++        for m in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) where NSLocationInRange(offset, m.range) {
++            var url = ns.substring(with: m.range)
++            while let c = url.last, ".,;:!?)]}".contains(c) { url.removeLast() }
++            let end = m.range.location + (url as NSString).length
++            guard offset < end else { return nil }
++            return (url, hit.row, max(m.range.location - rowStart, 0), min(end - rowStart, cols))
++        }
++        return nil
++    }
++
++    private var linkUnderline: NSView?
++
++    /// Underlines the URL under the mouse and explains how to open it; ⌘ shows the pointing-hand cursor.
++    func updateLinkHover (with event: NSEvent) {
++        guard let m = plainURLMatch(for: event) else {
++            linkUnderline?.removeFromSuperview(); linkUnderline = nil
++            toolTip = nil
++            return
++        }
++        let cw = cellDimension.width, ch = cellDimension.height
++        let y = bounds.height - CGFloat(m.screenRow + 1) * ch + 1
++        let frame = NSRect(x: CGFloat(m.startCol) * cw, y: y, width: CGFloat(m.endCol - m.startCol) * cw, height: 1)
++        let line = linkUnderline ?? {
++            let v = NSView(); v.wantsLayer = true; addSubview(v); linkUnderline = v; return v
++        }()
++        line.layer?.backgroundColor = nativeForegroundColor.cgColor
++        line.frame = frame
++        toolTip = "⌘-click to open \(m.url)"
++        if event.modifierFlags.contains(.command) { NSCursor.pointingHand.set() }
++    }
++
+     var didSelectionDrag: Bool = false
+-    
++
+     public override func mouseUp(with event: NSEvent) {
+         if event.modifierFlags.contains(.command){
+-            if let payload = getPayload(for: event) as? String {
+-                if let (url, params) = urlAndParamsFrom(payload: payload) {
+-                    terminalDelegate?.requestOpenLink(source: self, link: url, params: params)
+-                }
++            if let payload = getPayload(for: event) as? String,
++               let (url, params) = urlAndParamsFrom(payload: payload) {
++                terminalDelegate?.requestOpenLink(source: self, link: url, params: params)
++            } else if let url = plainURL(for: event) {
++                terminalDelegate?.requestOpenLink(source: self, link: url, params: [:])
+             }
+         }
+-        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
+-            sharedMouseEvent(with: event)
++        if mouseGoesToApp {
++            mouseGoesToApp = false
++            if terminal.mouseMode.sendButtonRelease() { sharedMouseEvent(with: event) }
+             return
+         }
+         
+@@ -887,7 +949,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+     public override func mouseDragged(with event: NSEvent) {
+         let mouseHit = calculateMouseHit(with: event)
+         let hit = mouseHit.grid
+-        if allowMouseReporting {
++        if mouseGoesToApp {
+             if terminal.mouseMode.sendMotionEvent() {
+                 let flags = encodeMouseEvent(with: event)
+             
+@@ -895,9 +957,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+             
+                 return
+             }
+-            if terminal.mouseMode != .off {
+-                return
+-            }
++            return
+         }
+                 
+         if selection.active {
+@@ -983,6 +1043,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+     
+     public override func mouseMoved(with event: NSEvent) {
+         let hit = calculateMouseHit(with: event)
++        updateLinkHover(with: event)
+         if commandActive {
+             if let payload = getPayload(for: event) as? String {
+                 previewUrl (payload: payload)
+@@ -995,10 +1056,35 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+         }
+     }
+     
++    private var wheelRemainder: CGFloat = 0
++
+     public override func scrollWheel(with event: NSEvent) {
+-        if event.deltaY == 0 {
++        // Full-screen apps (claude, vim, less) own the wheel: forward it as mouse-wheel reports, or as arrow
++        // keys on the alternate screen without mouse tracking. Shift forces local scrollback.
++        let alt = terminal.buffers.isAlternateBuffer
++        if !event.modifierFlags.contains(.shift),
++           (allowMouseReporting && terminal.mouseMode != .off) || alt {
++            if event.phase == .began || event.phase == .mayBegin { wheelRemainder = 0 }
++            wheelRemainder += event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / max(cellDimension.height, 1) : event.deltaY
++            let steps = Int(wheelRemainder)
++            if steps == 0 { return }
++            wheelRemainder -= CGFloat(steps)
++            let up = steps > 0
++            if allowMouseReporting && terminal.mouseMode != .off {
++                let hit = calculateMouseHit(with: event)
++                let flags = terminal.encodeButton(button: up ? 4 : 5, release: false, shift: false,
++                                                  meta: event.modifierFlags.contains(.option), control: event.modifierFlags.contains(.control))
++                for _ in 0..<min(abs(steps), 20) {
++                    terminal.sendEvent(buttonFlags: flags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
++                }
++            } else {
++                let key = up ? (terminal.applicationCursor ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal)
++                             : (terminal.applicationCursor ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal)
++                for _ in 0..<min(abs(steps), 20) { send(key) }
++            }
+             return
+         }
++        if event.deltaY == 0 { return }
+         let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
+         if event.deltaY > 0 {
+             scrollUp (lines: velocity)
+@@ -1140,6 +1226,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+     public func iTermContent (source: Terminal, content: ArraySlice<UInt8>) {
+         terminalDelegate?.iTermContent(source: self, content: content)
+     }
++
++    // OSC 52 from the application (tmux set-clipboard) reaches the app's delegate.
++    public func clipboardCopy(source: Terminal, content: Data) {
++        terminalDelegate?.clipboardCopy(source: self, content: content)
++    }
+ }
+ 
+ 
+diff --git a/Sources/SwiftTerm/Terminal.swift b/Sources/SwiftTerm/Terminal.swift
+index a58968d..3a2be3d 100644
+--- a/Sources/SwiftTerm/Terminal.swift
++++ b/Sources/SwiftTerm/Terminal.swift
+@@ -1436,16 +1436,10 @@ open class Terminal {
+     
+     // Copy to clipboard with sequence on the form:
+     //    ESC ] 52 ; c ; [base64 data] \a
+-    // where c is for copy and the only thing supported.
++    // The selection parameter may be empty or any of c, p, s, q, 0-7 (tmux sends it empty); queries (?) are ignored.
+     func oscClipboard (_ data: ArraySlice<UInt8>) {
+-        // we require data to start with c; followed by base64 content
+-        guard data.count >= 2,
+-              data[data.startIndex] == UInt8(ascii: "c"),
+-              data[data.startIndex+1] == UInt8(ascii: ";") else {
+-            return
+-        }
+-        
+-        let base64 = Data(data[(data.startIndex+2)...])
++        guard let semi = data.firstIndex(of: UInt8(ascii: ";")) else { return }
++        let base64 = Data(data[(semi+1)...])
+         guard let content = Data(base64Encoded: base64) else {
+             return
+         }
+@@ -3203,6 +3197,8 @@ open class Terminal {
+     //
+     func cmdCharAttributes (_ pars: [Int], _ collect: cstring)
+     {
++        // CSI > Pp m, CSI ? Pp m and CSI < Pp m are xterm key-modifier options (e.g. modifyOtherKeys CSI > 4 m), not SGR.
++        if !collect.isEmpty { return }
+         // Optimize a single SGR0.
+         if pars.count == 1 && pars [0] == 0 {
+             curAttr = CharData.defaultAttr
+diff --git a/Sources/SwiftTerm/TerminalOptions.swift b/Sources/SwiftTerm/TerminalOptions.swift
+index db3a4b4..a84c699 100644
+--- a/Sources/SwiftTerm/TerminalOptions.swift
++++ b/Sources/SwiftTerm/TerminalOptions.swift
+@@ -66,7 +66,7 @@ public struct TerminalOptions {
+                                                        termName: "xterm-256color",
+                                                        cursorStyle: .blinkBlock,
+                                                        screenReaderMode: false,
+-                                                       scrollback: 500,
++                                                       scrollback: 10_000,
+                                                        tabStopWidth: 8,
+                                                        enableSixelReported: true)
+ 
+diff --git a/Sources/SwiftTerm/Utilities.swift b/Sources/SwiftTerm/Utilities.swift
+index e2b015c..1574137 100644
+--- a/Sources/SwiftTerm/Utilities.swift
++++ b/Sources/SwiftTerm/Utilities.swift
+@@ -158,6 +158,10 @@ struct UnicodeUtil {
+             return 0
+         }
+         
++        /* Emoji shown as pictures take two columns, as in tmux and current wcwidth tables. */
++        if rune.properties.isEmojiPresentation {
++            return 2
++        }
+         /* if we arrive here, ucs is not a combining or C0/C1 control character */
+         return 1 +
+             ((irune >= 0x1100 &&
